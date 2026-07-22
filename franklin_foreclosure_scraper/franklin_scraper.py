@@ -1,0 +1,341 @@
+"""
+Franklin County Case Information Online scraper.
+
+Starting from a single caseSeq you provide, walks forward one case at a time
+(005510, 005511, 005512, ...) under one caseYear/caseType, and appends any
+FORECLOSURES cases found to a Google Sheet (append-only, never overwrites
+existing rows). Stops once MAX_CONSECUTIVE_MISSES case numbers in a row come
+back empty -- that's treated as "reached the end."
+
+Handles:
+  - one session/cookie jar reused across the whole run (only 1 disclaimer
+    accept + only 1 "GET home" needed, not per-case)
+  - polite rate limiting between requests
+  - retry with backoff on timeout / connection errors
+
+Requires: pip install gspread google-auth
+Uses the service account key at config/service_account.json -- make sure
+that service account's email is shared as an Editor on the target Sheet.
+"""
+import datetime
+import re
+import sys
+import time
+import requests
+from bs4 import BeautifulSoup
+import gspread
+from google.oauth2.service_account import Credentials
+
+# Force UTF-8 + line-buffered stdout/stderr.
+#   - encoding="utf-8": without this, Windows falls back to the system
+#     codepage (e.g. cp1252) whenever output isn't a real console -- which is
+#     exactly what happens when stdout is redirected to a file
+#     (`python franklin_scraper.py >> logs\run_log.txt`), and cp1252 can't
+#     encode the checkmark/cross icons used below, crashing the whole run.
+#   - line_buffering=True: Python fully buffers stdout when it isn't a real
+#     console, so without this, log lines pile up in memory and never reach
+#     the log file until the process exits -- making a long-running task
+#     look like it's produced no output even while it's working fine.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+
+
+def log_message(message, color=None):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    formatted_message = f"{timestamp} - {message}"
+    # Print with color if specified
+    print(f"{formatted_message}")
+
+
+BASE = "https://fcdcfcjs.co.franklin.oh.us/CaseInformationOnline/"
+SEARCH_URL = "https://fcdcfcjs.co.franklin.oh.us/CaseInformationOnline/caseSearch"
+
+USER_AGENT = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36')
+
+COMMON_HEADERS = {
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'accept-language': 'en-US,en;q=0.5',
+    'sec-ch-ua': '"Not;A=Brand";v="8", "Chromium";v="150", "Brave";v="150"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"macOS"',
+    'sec-gpc': '1',
+    'user-agent': USER_AGENT,
+}
+
+SERVICE_ACCOUNT_FILE = "config/service_account.json"
+SHEET_ID = "1-4vsPPHH9m-vzbKa-fZ3mP7CrDPnEqwVAlVkfXhvitQ"
+SHEET_TAB = "Lawsuits"
+SHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# order matches the client's required column order
+SHEET_HEADERS = [
+    "Case Number", "Type of Case", "Status", "Date Filed",
+    "Defendant Name", "Plaintiff Name", "Case ID/Link", "Scraped Date",
+]
+
+# be polite to an old government server
+REQUEST_DELAY_SECONDS = 1.0
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 5
+
+def build_payload(case_year: str, case_type: str, case_seq: str) -> dict:
+    return {
+        'attyIdx': '',
+        'advFlag': '',
+        'reallySubmit': 'true',
+        'lname': '',
+        'fname': '',
+        'mint': '',
+        'selType': ' ',
+        'caseYear': case_year,
+        'caseYear_h': case_year,
+        'caseType': case_type,
+        'caseType_h': case_type,
+        'caseSeq': case_seq,
+        'caseSeq_h': case_seq,
+        'personType': 'P',
+        'attyNum': '',
+        'txtCalendar1': '',
+        'txtCalendar2': '',
+        'recs': '25',
+    }
+
+
+def start_session() -> requests.Session:
+    """One session for the whole range walk: GET home, accept disclaimer if shown."""
+    session = requests.Session()
+    session.headers.update(COMMON_HEADERS)
+
+    home_resp = session.get(BASE, timeout=30)
+    log_message(f"GET home -> {home_resp.status_code} {len(home_resp.text)} bytes")
+
+    if "Conditions of Use" in home_resp.text:
+        m = re.search(r"acceptDisclaimer\?([^\"'>]+)", home_resp.text)
+        if not m:
+            sys.exit("Disclaimer page shown but couldn't find the acceptDisclaimer token")
+        accept_url = f"{BASE}acceptDisclaimer?{m.group(1)}"
+        accept_headers = {
+            **COMMON_HEADERS,
+            'content-type': 'application/x-www-form-urlencoded',
+            'origin': 'https://fcdcfcjs.co.franklin.oh.us',
+            'referer': BASE,
+        }
+        accept_resp = session.post(
+            accept_url, headers=accept_headers,
+            data={"fromPage": "index", "Accept": "ACCEPT"},
+            timeout=30,
+        )
+        log_message(f"POST acceptDisclaimer -> {accept_resp.status_code} {len(accept_resp.text)} bytes")
+        if "Conditions of Use" in accept_resp.text:
+            sys.exit("Still on the disclaimer page after accepting -- accept step did not stick")
+    else:
+        log_message("No disclaimer shown (session already had a prior 'accepted' cookie).")
+
+    return session
+
+
+def fetch_case(session: requests.Session, case_year: str, case_type: str, case_seq: str):
+    """POST one case lookup, with retry on timeout/connection errors. Returns
+    the response text, or None if it kept failing after MAX_RETRIES."""
+    payload = build_payload(case_year, case_type, case_seq)
+    search_headers = {
+        **COMMON_HEADERS,
+        'content-type': 'application/x-www-form-urlencoded',
+        'origin': 'https://fcdcfcjs.co.franklin.oh.us',
+        'referer': BASE,
+    }
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = session.post(SEARCH_URL, headers=search_headers, data=payload, timeout=30)
+            return response.text
+        except (requests.Timeout, requests.ConnectionError) as e:
+            log_message(f"  [{case_year} {case_type} {case_seq}] request failed (attempt {attempt}/{MAX_RETRIES}): {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+    log_message(f"  [{case_year} {case_type} {case_seq}] giving up after {MAX_RETRIES} attempts")
+    return None
+
+
+def parse_case(html: str):
+    """Returns a result dict if this is a FORECLOSURES case, 'missing' if the
+    case number doesn't exist / is sealed, or None if it exists but isn't a
+    foreclosure (or the page didn't parse as expected)."""
+    if "NO CASE MATCHED THE SEARCH CRITERIA" in html.upper():
+        return "missing"
+
+    soup = BeautifulSoup(html, "html.parser")
+    case_summary = soup.select_one("section#case-summary-container tbody tr")
+    if case_summary is None:
+        return "missing"
+
+    tds = case_summary.select("td")
+    if len(tds) < 5:
+        return "missing"
+
+    type_of_case = tds[2].text.strip()
+    case_number = tds[1].text.strip()
+    status = tds[3].text.strip()
+    date_filed = tds[4].text.strip()
+
+    plaintiff_element = soup.select_one("tbody#plaintiff-body tr")
+    plaintiff_name = plaintiff_element.select("td")[1].text.strip() if plaintiff_element else ""
+
+    defendant_element = soup.select_one("tbody#defendant-body tr")
+    defendant_name = defendant_element.select("td")[1].text.strip() if defendant_element else ""
+
+    return {
+        "case_number": case_number,
+        "type": type_of_case,
+        "status": status,
+        "date_filed": date_filed,
+        "plaintiff_name": plaintiff_name,
+        "defendant_name": defendant_name,
+    }
+
+
+def get_worksheet():
+    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SHEET_SCOPES)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(SHEET_ID)
+    ws = sh.worksheet(SHEET_TAB)
+    if not ws.row_values(1):
+        ws.append_row(SHEET_HEADERS, value_input_option="RAW")
+    return ws
+
+
+def get_existing_case_numbers(ws) -> set:
+    """Read the whole 'Case Number' column (col A) so we can skip re-adding
+    a case that's already in the sheet, and so the resume high-water mark
+    can be derived from it too. The sheet itself is the single source of
+    truth for "did I already write this case" and "where did I leave off."""
+    col_a = ws.col_values(1)  # includes the header row
+    return set(col_a[1:]) if col_a else set()
+
+
+def save_to_sheet(ws, row: dict, existing_case_numbers: set):
+    """gspread's append_row() calls the Sheets API values.append endpoint,
+    which always inserts after the last row with data -- it cannot overwrite
+    existing rows. Skips writing if this case_number is already present."""
+    if row["case_number"] in existing_case_numbers:
+        return
+
+    values = [
+        row["case_number"],
+        row["type"],
+        row["status"],
+        row["date_filed"],
+        row["defendant_name"],
+        row["plaintiff_name"],
+        row["case_number"],  # Case ID/Link -- site has no stable permalink, case number doubles as the ID/link
+        datetime.date.today().isoformat(),  # Scraped Date
+    ]
+    ws.append_row(values, value_input_option="RAW")
+    existing_case_numbers.add(row["case_number"])
+
+
+MAX_CONSECUTIVE_MISSES = 10
+
+
+def load_high_water_mark_from_sheet(existing_case_numbers: set, case_year: str, case_type: str):
+    """Resume source: the Google Sheet's own 'Case Number' column (no local
+    state file). Scans existing_case_numbers (already read from the sheet)
+    for entries belonging to this case_year/case_type,
+    and returns the highest caseSeq found + 1 -- i.e. skip every case
+    number already in the sheet and start right after the last one.
+    Returns None if no matching case number is in the sheet yet (first run
+    for this year/type combo, so startSeq is used instead)."""
+    prefix = f"{case_year}{case_type}".upper()
+    max_seq = None
+    for case_number in existing_case_numbers:
+        normalized = re.sub(r"\s+", "", case_number).upper()
+        if not normalized.startswith(prefix):
+            continue
+        m = re.search(r"(\d+)$", normalized)
+        if not m:
+            continue
+        seq = int(m.group(1))
+        if max_seq is None or seq > max_seq:
+            max_seq = seq
+    return None if max_seq is None else max_seq + 1
+
+
+def walk_from(case_year: str, case_type: str, start_seq: int):
+    """Pagination by simple caseSeq increment: 005510, 005511, 005512, ...
+    One session reused for the whole run. Individual case numbers can be
+    gaps (sealed/missing) even while later numbers still have data, so this
+    only stops once MAX_CONSECUTIVE_MISSES in a row come back empty -- any
+    hit in between resets the miss counter.
+
+    Resumes from the Google Sheet's own Case Number column (highest caseSeq
+    already there, for this case_year/case_type) if a match exists --
+    startSeq is only used on the very first run / first time this
+    case_year/case_type shows up in the sheet."""
+    session = start_session()
+    ws = get_worksheet()
+    existing_case_numbers = get_existing_case_numbers(ws)
+    log_message(f"Writing to Google Sheet '{ws.spreadsheet.title}' / tab '{ws.title}' "
+                f"({len(existing_case_numbers)} case(s) already in it)")
+
+    resume_seq = load_high_water_mark_from_sheet(existing_case_numbers, case_year, case_type)
+    if resume_seq is not None:
+        log_message(f"Resuming from Google Sheet high-water mark: {case_year} {case_type} "
+                    f"{str(resume_seq).zfill(6)} (ignoring startSeq={start_seq})")
+        seq = resume_seq
+    else:
+        log_message(f"No matching case numbers found in the sheet yet -- starting fresh from "
+                    f"{case_year} {case_type} {str(start_seq).zfill(6)}")
+        seq = start_seq
+
+    found = 0
+    checked = 0
+    consecutive_misses = 0
+    last_completed_seq = seq - 1  # nothing successfully checked yet
+
+    while True:
+        case_seq = str(seq).zfill(6)
+        checked += 1
+
+        html = fetch_case(session, case_year, case_type, case_seq)
+        if html is None:
+            log_message("  -> request kept failing, stopping.")
+            break
+
+        result = parse_case(html)
+        reached_end_now = False
+
+        if result == "missing":
+            consecutive_misses += 1
+            log_message(f"❌ [{checked}] {case_year} {case_type} {case_seq} | NO Case data available")
+            if consecutive_misses >= MAX_CONSECUTIVE_MISSES:
+                log_message(f"  -> hit {MAX_CONSECUTIVE_MISSES} consecutive misses, stopping.")
+                reached_end_now = True
+        else:
+            consecutive_misses = 0
+            if result is not None:
+                save_to_sheet(ws, result, existing_case_numbers)
+                found += 1
+                log_message(f"✅ [{checked}] {case_seq} | {result['type']} | {result['status']} | {result['date_filed']}")
+        last_completed_seq = seq
+
+        if reached_end_now:
+            break
+
+        seq += 1
+        time.sleep(REQUEST_DELAY_SECONDS)
+
+    log_message(f"Done. Checked {checked} cases, {found} foreclosures found. "
+                f"High-water mark now at {case_year} {case_type} {str(last_completed_seq).zfill(6)}.")
+    return found
+
+
+if __name__ == "__main__":
+    caseYear = "26"
+    caseType = "CV"
+    startSeq = 5000   # e.g. 005510 -- only used on the very first run;
+                      # after that, the Google Sheet's own high-water mark wins
+
+    walk_from(caseYear, caseType, startSeq)
